@@ -37,6 +37,16 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+// envInt reads a non-negative integer, falling back when the variable is
+// unset or malformed.
+func envInt(key string, fallback int) int {
+	n, err := strconv.Atoi(env(key, ""))
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
+}
+
 func envBool(key string, fallback bool) bool {
 	v, err := strconv.ParseBool(env(key, ""))
 	if err != nil {
@@ -70,21 +80,9 @@ func main() {
 	relay.CountEvents = append(relay.CountEvents, db.CountEvents)
 	relay.ReplaceEvent = append(relay.ReplaceEvent, db.ReplaceEvent)
 
-	// Size limits apply whatever the admission policy is. An open relay with
-	// no ceiling is a free disk for whoever finds it first.
-	maxContent, _ := strconv.Atoi(env("HNS_RELAY_MAX_CONTENT", "65536"))
+	// These limits apply whatever the admission policy is.
 	relay.RejectEvent = append(relay.RejectEvent,
-		func(ctx context.Context, event *nostr.Event) (bool, string) {
-			if len(event.Content) > maxContent {
-				return true, fmt.Sprintf("invalid: content over %d bytes", maxContent)
-			}
-			// Refuse events dated far in the future: they sort to the top of
-			// every client's feed and stay there.
-			if event.CreatedAt.Time().After(time.Now().Add(15 * time.Minute)) {
-				return true, "invalid: created_at is in the future"
-			}
-			return false, ""
-		})
+		eventLimits(envInt("HNS_RELAY_MAX_CONTENT", 65536)))
 
 	// Name admission is off by default; see admission.go.
 	if envBool("HNS_RELAY_REQUIRE_NAME", false) {
@@ -92,7 +90,7 @@ func main() {
 		if !validSuffix(suffix) {
 			log.Fatalf("HNS_RELAY_SUFFIX %q is not a DNS suffix", suffix)
 		}
-		ttl := time.Duration(mustInt(env("HNS_RELAY_CACHE_MINUTES", "60"))) * time.Minute
+		ttl := time.Duration(envInt("HNS_RELAY_CACHE_MINUTES", 60)) * time.Minute
 		checker := newNameChecker(suffix, ttl)
 		relay.RejectEvent = append(relay.RejectEvent,
 			func(ctx context.Context, event *nostr.Event) (bool, string) {
@@ -119,10 +117,17 @@ func main() {
 	}
 }
 
-func mustInt(s string) int {
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return 60
+// eventLimits rejects events whose content is over maxContent bytes, and
+// events dated more than 15 minutes ahead, which would otherwise sit at the
+// top of every client's feed.
+func eventLimits(maxContent int) func(context.Context, *nostr.Event) (bool, string) {
+	return func(_ context.Context, event *nostr.Event) (bool, string) {
+		if len(event.Content) > maxContent {
+			return true, fmt.Sprintf("invalid: content over %d bytes", maxContent)
+		}
+		if event.CreatedAt.Time().After(time.Now().Add(15 * time.Minute)) {
+			return true, "invalid: created_at is in the future"
+		}
+		return false, ""
 	}
-	return n
 }
