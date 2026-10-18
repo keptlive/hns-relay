@@ -1,4 +1,4 @@
-module github.com/hnsone/hns-relay
+module github.com/keptlive/hns-relay
 
 go 1.25.0
 

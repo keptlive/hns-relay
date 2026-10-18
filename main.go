@@ -64,7 +64,7 @@ func main() {
 		"An ordinary Nostr relay, run by hns.one, that also understands Handshake names.")
 	relay.Info.PubKey = os.Getenv("HNS_RELAY_PUBKEY")
 	relay.Info.Contact = env("HNS_RELAY_CONTACT", "hello@hns.one")
-	relay.Info.Software = "https://github.com/hnsone/hns-relay"
+	relay.Info.Software = "https://github.com/keptlive/hns-relay"
 	relay.Info.SupportedNIPs = []any{1, 11, 42, 70}
 
 	dbPath := env("HNS_RELAY_DB", "./relay-db")
