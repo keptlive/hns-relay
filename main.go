@@ -86,11 +86,12 @@ func main() {
 			return false, ""
 		})
 
-	// HNS admission. OFF by default, on purpose: until there is adoption to
-	// protect, a relay that turns strangers away is a relay that never gets
-	// any. The code is here, tested and ready, for the day that flips.
+	// Name admission is off by default; see admission.go.
 	if envBool("HNS_RELAY_REQUIRE_NAME", false) {
 		suffix := env("HNS_RELAY_SUFFIX", "")
+		if !validSuffix(suffix) {
+			log.Fatalf("HNS_RELAY_SUFFIX %q is not a DNS suffix", suffix)
+		}
 		ttl := time.Duration(mustInt(env("HNS_RELAY_CACHE_MINUTES", "60"))) * time.Minute
 		checker := newNameChecker(suffix, ttl)
 		relay.RejectEvent = append(relay.RejectEvent,
@@ -98,12 +99,10 @@ func main() {
 				if checker.admits(ctx, event) {
 					return false, ""
 				}
-				// "restricted:" is the NIP-01 prefix clients understand as
-				// "you are not allowed", as opposed to "your event is bad".
-				// Say what is actually required. "Publish a kind:0 first" was
-				// the obvious wording and it is wrong: the kind:0 is checked
-				// by the same rule, so the missing piece is never the event --
-				// it is the name's own NIP-05 document.
+				// "restricted:" is the NIP-01 prefix for "not allowed", as
+				// opposed to "invalid:" for a malformed event. The kind:0 is
+				// checked by the same rule, so the fix is always the name's
+				// NIP-05 document, not another event.
 				return true, "restricted: this relay serves Handshake name holders. " +
 					"Set your nip05 to a name whose /.well-known/nostr.json " +
 					"resolves to your pubkey, then try again"
