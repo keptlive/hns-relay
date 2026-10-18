@@ -7,8 +7,14 @@ package main
 // The claimed name comes from a stranger's event and ends up in a URL, so it
 // must be a bare DNS hostname before anything is fetched, and the HTTP client
 // connects only to public addresses.
+//
+// Every lookup is an outbound request a stranger can cause, so lookups are
+// shared, remembered and rationed: events that claim the same name at the
+// same time wait for one fetch, a name's answer is reused for a few minutes,
+// and fetches per minute are capped in all and per client address.
 
 import (
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,26 +39,39 @@ type nip05Doc struct {
 	Names map[string]string `json:"names"`
 }
 
-// nameChecker answers "does this pubkey control a name under our suffix?",
-// caching positive answers because the relay asks on every event.
+// checkerConfig holds the admission settings. A lookup limit of 0 means no
+// limit.
+type checkerConfig struct {
+	ttl          time.Duration // how long an admitted pubkey stays admitted
+	negativeTTL  time.Duration // how long a name's lookup answer is reused
+	cacheSize    int           // most entries in each cache
+	lookups      int           // outbound lookups per minute, in all
+	lookupsPerIP int           // outbound lookups per minute for one client address
+}
+
+// nameChecker answers "does this pubkey control a name under our suffix?".
 type nameChecker struct {
 	suffix string // "" (any name) or a lower-case suffix with a leading dot
-	ttl    time.Duration
 	client *http.Client
-	mu     sync.Mutex
-	cache  map[string]cacheEntry
+	now    func() time.Time
+
+	mu       sync.Mutex
+	admitted *lru               // pubkey -> the name it was admitted with
+	answers  *lru               // lookup URL -> the pubkey it named, "" if the lookup failed
+	inflight map[string]*lookup // lookups being fetched, by URL
+	limit    lookupLimit
 }
 
-type cacheEntry struct {
-	name string
-	when time.Time
+// lookup is one NIP-05 fetch in progress.
+type lookup struct {
+	done  chan struct{}
+	owner string // set before done is closed
 }
 
-func newNameChecker(suffix string, ttl time.Duration) *nameChecker {
+func newNameChecker(suffix string, cfg checkerConfig) *nameChecker {
 	dialer := &net.Dialer{Timeout: 5 * time.Second, Control: publicOnly}
 	return &nameChecker{
 		suffix: normalizeSuffix(suffix),
-		ttl:    ttl,
 		client: &http.Client{
 			Timeout: 6 * time.Second,
 			// No proxy: the dialer's address check must see the real target.
@@ -67,7 +86,11 @@ func newNameChecker(suffix string, ttl time.Duration) *nameChecker {
 				return http.ErrUseLastResponse
 			},
 		},
-		cache: map[string]cacheEntry{},
+		now:      time.Now,
+		admitted: newLRU(cfg.cacheSize, cfg.ttl),
+		answers:  newLRU(cfg.cacheSize, cfg.negativeTTL),
+		inflight: map[string]*lookup{},
+		limit:    lookupLimit{total: cfg.lookups, perIP: cfg.lookupsPerIP},
 	}
 }
 
@@ -178,56 +201,197 @@ func (n *nameChecker) nip05URL(claim string) (string, error) {
 	return u.String(), nil
 }
 
-// verify fetches the name's own NIP-05 document and reports whether it maps
-// "_" to this pubkey. The lookup goes to the name's host, never to a
-// registry index.
-func (n *nameChecker) verify(ctx context.Context, claim, pubkey string) bool {
-	target, err := n.nip05URL(claim)
-	if err != nil {
-		return false
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-	if err != nil {
-		return false
-	}
-	res, err := n.client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return false
-	}
-	var doc nip05Doc
-	if err := json.NewDecoder(io.LimitReader(res.Body, maxNIP05Body)).Decode(&doc); err != nil {
-		return false
-	}
-	return strings.EqualFold(doc.Names["_"], pubkey)
-}
+var (
+	errNotAdmitted = errors.New("no verified name under the suffix")
+	errRateLimited = errors.New("too many name lookups")
+)
 
-// admits reports whether a pubkey may write, caching the affirmative answer.
-// A negative is not cached, so someone who has just set up their name can
-// post straight away.
-func (n *nameChecker) admits(ctx context.Context, event *nostr.Event) bool {
+// admits reports whether an event's author may write: nil if so,
+// errRateLimited if deciding needs a lookup that is over the limit, and
+// errNotAdmitted otherwise. ip is the client address the event came from.
+func (n *nameChecker) admits(ctx context.Context, ip string, event *nostr.Event) error {
 	n.mu.Lock()
-	entry, ok := n.cache[event.PubKey]
+	_, ok := n.admitted.get(event.PubKey, n.now())
 	n.mu.Unlock()
-	if ok && time.Since(entry.when) < n.ttl {
-		return true
+	if ok {
+		return nil
 	}
 	// The claim is read from the event and is worth nothing until the
 	// name's own NIP-05 document agrees with it.
-	name := claimedName(event)
-	if name == "" {
-		return false
+	target, err := n.nip05URL(claimedName(event))
+	if err != nil {
+		return errNotAdmitted
 	}
-	if !n.verify(ctx, name, event.PubKey) {
-		return false
+	owner, err := n.owner(ctx, ip, target)
+	if err != nil {
+		return err
+	}
+	if owner == "" || !strings.EqualFold(owner, event.PubKey) {
+		return errNotAdmitted
 	}
 	n.mu.Lock()
-	n.cache[event.PubKey] = cacheEntry{name: name, when: time.Now()}
+	n.admitted.put(event.PubKey, target, n.now())
 	n.mu.Unlock()
+	return nil
+}
+
+// owner returns the pubkey that target maps "_" to, or "" if the lookup
+// fails. A recent answer is reused, an event that arrives while the same
+// lookup is running waits for it, and only a new fetch counts against the
+// limits.
+func (n *nameChecker) owner(ctx context.Context, ip, target string) (string, error) {
+	n.mu.Lock()
+	if owner, ok := n.answers.get(target, n.now()); ok {
+		n.mu.Unlock()
+		return owner, nil
+	}
+	if l, ok := n.inflight[target]; ok {
+		n.mu.Unlock()
+		<-l.done // the client timeout bounds the wait
+		return l.owner, nil
+	}
+	if !n.limit.allow(ip, n.now()) {
+		n.mu.Unlock()
+		return "", errRateLimited
+	}
+	l := &lookup{done: make(chan struct{})}
+	n.inflight[target] = l
+	n.mu.Unlock()
+
+	// The fetch is not cancelled with the event that started it: others
+	// may be waiting for it, and one client hanging up must not record a
+	// failed lookup against someone else's name.
+	l.owner = n.fetch(context.WithoutCancel(ctx), target)
+
+	n.mu.Lock()
+	n.answers.put(target, l.owner, n.now())
+	delete(n.inflight, target)
+	n.mu.Unlock()
+	close(l.done)
+	return l.owner, nil
+}
+
+// fetch reads a name's own NIP-05 document and returns the pubkey it maps
+// "_" to, or "" if it cannot. The lookup goes to the name's host, never to
+// a registry index.
+func (n *nameChecker) fetch(ctx context.Context, target string) string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return ""
+	}
+	res, err := n.client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return ""
+	}
+	var doc nip05Doc
+	if err := json.NewDecoder(io.LimitReader(res.Body, maxNIP05Body)).Decode(&doc); err != nil {
+		return ""
+	}
+	return doc.Names["_"]
+}
+
+// lookupLimit counts outbound lookups in the current minute, in all and per
+// client address. A limit of 0 means no limit. Callers hold nameChecker.mu.
+type lookupLimit struct {
+	total, perIP int
+	window       time.Time
+	count        int
+	byIP         map[string]int
+}
+
+// allow reports whether one more lookup fits in this minute, and counts it
+// if so. An address gets an entry only when a lookup is allowed, so with a
+// total limit the map never holds more than that many addresses.
+func (l *lookupLimit) allow(ip string, now time.Time) bool {
+	if now.Sub(l.window) >= time.Minute {
+		l.window, l.count, l.byIP = now, 0, map[string]int{}
+	}
+	if l.total > 0 && l.count >= l.total || l.perIP > 0 && l.byIP[ip] >= l.perIP {
+		return false
+	}
+	l.count++
+	if l.perIP > 0 {
+		l.byIP[ip]++
+	}
 	return true
+}
+
+// clientAddress returns the address an event's connection came from, as a
+// key for the per-address lookup limit. A connection from a loopback or
+// private address is taken to be the relay's own proxy, and the client is
+// the last X-Forwarded-For entry, the one that proxy added; earlier entries
+// were sent by the client and prove nothing. IPv6 addresses are grouped by
+// /64, the usual size of one customer's network.
+func clientAddress(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if peer, err := netip.ParseAddr(host); err == nil && (peer.IsLoopback() || peer.Unmap().IsPrivate()) {
+		if xff := r.Header.Values("X-Forwarded-For"); len(xff) > 0 {
+			entries := strings.Split(xff[len(xff)-1], ",")
+			if last := strings.TrimSpace(entries[len(entries)-1]); last != "" {
+				host = last
+			}
+		}
+	}
+	if ip, err := netip.ParseAddr(host); err == nil && ip.Is6() && !ip.Is4In6() {
+		prefix, _ := ip.Prefix(64)
+		return prefix.String()
+	}
+	return host
+}
+
+// lru is a map from string to string with a size bound and an expiry. When
+// it is full the least recently used entry is dropped. Callers hold
+// nameChecker.mu.
+type lru struct {
+	max   int
+	ttl   time.Duration
+	order *list.List               // most recently used first; values are *lruEntry
+	items map[string]*list.Element // by key
+}
+
+type lruEntry struct {
+	key, value string
+	expires    time.Time
+}
+
+func newLRU(max int, ttl time.Duration) *lru {
+	return &lru{max: max, ttl: ttl, order: list.New(), items: map[string]*list.Element{}}
+}
+
+func (c *lru) get(key string, now time.Time) (string, bool) {
+	el, ok := c.items[key]
+	if !ok {
+		return "", false
+	}
+	entry := el.Value.(*lruEntry)
+	if !now.Before(entry.expires) {
+		c.order.Remove(el)
+		delete(c.items, key)
+		return "", false
+	}
+	c.order.MoveToFront(el)
+	return entry.value, true
+}
+
+func (c *lru) put(key, value string, now time.Time) {
+	if el, ok := c.items[key]; ok {
+		el.Value = &lruEntry{key, value, now.Add(c.ttl)}
+		c.order.MoveToFront(el)
+	} else {
+		c.items[key] = c.order.PushFront(&lruEntry{key, value, now.Add(c.ttl)})
+	}
+	for c.order.Len() > c.max {
+		oldest := c.order.Back()
+		c.order.Remove(oldest)
+		delete(c.items, oldest.Value.(*lruEntry).key)
+	}
 }
 
 // claimedName reads a name out of an event: the `hns` or `nip05` field of a

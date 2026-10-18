@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -77,12 +78,25 @@ func main() {
 		if !validSuffix(suffix) {
 			log.Fatalf("HNS_RELAY_SUFFIX %q is not a DNS suffix", suffix)
 		}
-		ttl := time.Duration(envInt("HNS_RELAY_CACHE_MINUTES", 60)) * time.Minute
-		checker := newNameChecker(suffix, ttl)
+		cfg := checkerConfig{
+			ttl:          time.Duration(envInt("HNS_RELAY_CACHE_MINUTES", 60)) * time.Minute,
+			negativeTTL:  time.Duration(envInt("HNS_RELAY_NEGATIVE_CACHE_MINUTES", 5)) * time.Minute,
+			cacheSize:    envInt("HNS_RELAY_CACHE_SIZE", 10000),
+			lookups:      envInt("HNS_RELAY_LOOKUPS_PER_MINUTE", 120),
+			lookupsPerIP: envInt("HNS_RELAY_IP_LOOKUPS_PER_MINUTE", 10),
+		}
+		checker := newNameChecker(suffix, cfg)
 		relay.RejectEvent = append(relay.RejectEvent,
 			func(ctx context.Context, event *nostr.Event) (bool, string) {
-				if checker.admits(ctx, event) {
+				ip := ""
+				if ws := khatru.GetConnection(ctx); ws != nil {
+					ip = clientAddress(ws.Request)
+				}
+				switch err := checker.admits(ctx, ip, event); {
+				case err == nil:
 					return false, ""
+				case errors.Is(err, errRateLimited):
+					return true, "rate-limited: too many name lookups, try again in a minute"
 				}
 				// "restricted:" is the NIP-01 prefix for "not allowed", as
 				// opposed to "invalid:" for a malformed event. The kind:0 is
@@ -92,7 +106,8 @@ func main() {
 					"Set your nip05 to a name whose /.well-known/nostr.json " +
 					"resolves to your pubkey, then try again"
 			})
-		log.Printf("admission: Handshake names only (suffix %q)", suffix)
+		log.Printf("admission: Handshake names only (suffix %q, %d lookups a minute, %d per address)",
+			suffix, cfg.lookups, cfg.lookupsPerIP)
 	} else {
 		log.Printf("admission: open to anyone")
 	}

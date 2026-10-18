@@ -33,6 +33,10 @@ timeout: subscriptions are long-lived and mostly idle, and nginx's default of
 | `HNS_RELAY_REQUIRE_NAME` | `false` | turn on name admission |
 | `HNS_RELAY_SUFFIX` | none | suffix admitted names must have, e.g. `.hns.one` |
 | `HNS_RELAY_CACHE_MINUTES` | `60` | how long an admitted pubkey stays admitted |
+| `HNS_RELAY_NEGATIVE_CACHE_MINUTES` | `5` | how long a name's lookup answer is reused |
+| `HNS_RELAY_CACHE_SIZE` | `10000` | most entries in each admission cache |
+| `HNS_RELAY_LOOKUPS_PER_MINUTE` | `120` | NIP-05 lookups per minute in all, `0` for no limit |
+| `HNS_RELAY_IP_LOOKUPS_PER_MINUTE` | `10` | NIP-05 lookups per minute for one client address, `0` for no limit |
 
 Whatever the admission setting, the relay rejects events whose content is
 larger than `HNS_RELAY_MAX_CONTENT` and events dated more than 15 minutes in
@@ -52,9 +56,32 @@ if all of these hold:
    redirect, and its `names._` entry is the event's pubkey.
 
 The lookup connects only to public IP addresses and reads at most 64 KiB.
-Admitted pubkeys are cached for `HNS_RELAY_CACHE_MINUTES`. Rejections are not
-cached, so every rejected event costs one outbound request. Rejections carry
-the NIP-01 `restricted:` prefix.
+Rejections carry the NIP-01 `restricted:` prefix.
+
+Each lookup is an outbound request that anyone can cause by posting, so the
+relay bounds them:
+
+- An admitted pubkey stays admitted for `HNS_RELAY_CACHE_MINUTES`, and its
+  later events need no claim.
+- A name's answer, match or not, is reused for
+  `HNS_RELAY_NEGATIVE_CACHE_MINUTES`. Someone who has just fixed their
+  `nostr.json` may wait that long.
+- Events that claim the same name at the same time share one lookup.
+- The relay makes at most `HNS_RELAY_LOOKUPS_PER_MINUTE` lookups a minute, and
+  `HNS_RELAY_IP_LOOKUPS_PER_MINUTE` for any one client address. An event that
+  needs a lookup past either limit is rejected with the `rate-limited:` prefix.
+- Each cache holds at most `HNS_RELAY_CACHE_SIZE` entries and drops the least
+  recently used first.
+
+The client address is the connection's peer, with IPv6 grouped by /64. When
+the peer is a loopback or private address, the relay takes it to be its own
+proxy and uses the last `X-Forwarded-For` entry instead, so the proxy should
+set that header. In nginx:
+
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+Without it, all clients share one address and the per-address limit acts as a
+second overall limit.
 
 To admit the holders of your own TLD, set `HNS_RELAY_SUFFIX` to it and serve
 `/.well-known/nostr.json` from each name.
