@@ -1,88 +1,68 @@
 # hns-relay
 
-A standards-compliant Nostr relay that knows about Handshake names.
+A Nostr relay (NIP-01, NIP-11) that can limit writes to people who control a
+name under a given domain suffix, checked with NIP-05 against the name's own
+host. It is built on [khatru](https://github.com/fiatjaf/khatru) and stores
+events in [badger](https://github.com/dgraph-io/badger).
 
-Run by HNS.ONE at **`wss://relay.14898.hns.one`**. The code is here so anyone
-can run one for their own Handshake TLD.
+hns.one runs an instance at `wss://social.hns.one`.
 
-## What it is, in order of importance
+## Build and run
 
-**1. An ordinary Nostr relay.** It speaks NIP-01 and nothing exotic. Any
-client reads from and writes to it, and the events it stores are plain events
-that work everywhere else. If that stopped being true the project would have
-built an island, which is the opposite of the point.
+Requires Go 1.25 or later.
 
-**2. Handshake-aware.** It can restrict writes to people who control a
-Handshake name, verified over NIP-05 against that name's **own zone**. This is
-**off by default** and stays off until there is adoption worth protecting: a
-relay nobody can post to is a relay nobody joins.
-
-## Running it
-
-    go build -o hns-relay .
+    CGO_ENABLED=0 go build -o hns-relay .
     ./hns-relay
 
-It listens on `127.0.0.1:7447` and stores events in `./relay-db` (badger, pure
-Go — the binary is static, no cgo, no system libraries).
+The relay listens on `127.0.0.1:7447` and stores events in `./relay-db`. Put it
+behind a TLS proxy that passes websockets through, and raise the proxy's read
+timeout: subscriptions are long-lived and mostly idle, and nginx's default of
+60 seconds closes them.
+
+## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `HNS_RELAY_ADDR` | `127.0.0.1:7447` | listen address |
 | `HNS_RELAY_DB` | `./relay-db` | event store directory |
 | `HNS_RELAY_NAME` | `hns.one relay` | NIP-11 name |
+| `HNS_RELAY_DESCRIPTION` | see `main.go` | NIP-11 description |
 | `HNS_RELAY_CONTACT` | `hello@hns.one` | NIP-11 contact |
-| `HNS_RELAY_PUBKEY` | — | NIP-11 operator pubkey |
-| `HNS_RELAY_MAX_CONTENT` | `65536` | reject larger events |
-| `HNS_RELAY_REQUIRE_NAME` | `false` | **admission control, see below** |
-| `HNS_RELAY_SUFFIX` | — | e.g. `.hns.one`, when admission is on |
-| `HNS_RELAY_CACHE_MINUTES` | `60` | how long an admitted key stays admitted |
+| `HNS_RELAY_PUBKEY` | none | NIP-11 operator pubkey |
+| `HNS_RELAY_MAX_CONTENT` | `65536` | largest accepted event content, in bytes |
+| `HNS_RELAY_REQUIRE_NAME` | `false` | turn on name admission |
+| `HNS_RELAY_SUFFIX` | none | suffix admitted names must have, e.g. `.hns.one` |
+| `HNS_RELAY_CACHE_MINUTES` | `60` | how long an admitted pubkey stays admitted |
 
-Put it behind a TLS terminator that passes websockets through. The one thing
-worth saying about that config: raise `proxy_read_timeout`. A relay
-subscription is a long-lived socket that is idle most of the time, and nginx's
-default 60s closes it mid-conversation — which every client reports as the
-relay dropping them.
+Whatever the admission setting, the relay rejects events whose content is
+larger than `HNS_RELAY_MAX_CONTENT` and events dated more than 15 minutes in
+the future.
 
-## Admission control
+## Name admission
 
-> **DO NOT TURN THIS ON YET (2026-08-21).** The suffix test is a substring
-> match on the built URL, so `{"hns":"127.0.0.1:38222/?x=.hns.one"}` both
-> passes admission and makes the relay fetch loopback — an SSRF with an
-> attacker-chosen target, one request per event. Validate that the claim is
-> purely a hostname before building any URL from it; the browser's
-> `verificationHost` in `browser/src/nostr/social-core.js` is the shape to
-> copy. Until then this section describes the intent, not the behaviour.
+Off by default. With `HNS_RELAY_REQUIRE_NAME=true`, an event is accepted only
+if all of these hold:
 
-With `HNS_RELAY_REQUIRE_NAME=true`, an event is accepted only if its author
-controls a Handshake name under `HNS_RELAY_SUFFIX`. The check is:
+1. It claims a name: the `hns` or `nip05` field of a kind 0 event, or a
+   `nip05` tag on any other event. A leading `_@` is ignored.
+2. The name is a plain DNS hostname under `HNS_RELAY_SUFFIX`: letters, digits
+   and hyphens, with no port, path, user part or IP address. With no suffix
+   set, any hostname passes this step.
+3. `https://<name>/.well-known/nostr.json?name=_` answers 200 without a
+   redirect, and its `names._` entry is the event's pubkey.
 
-1. read the name the author claims — the `nip05`/`hns` field of their `kind:0`,
-   or a `nip05` tag;
-2. fetch `https://<name>/.well-known/nostr.json?name=_`, following **no**
-   redirects;
-3. accept only if the document maps `_` to exactly that pubkey.
+The lookup connects only to public IP addresses and reads at most 64 KiB.
+Admitted pubkeys are cached for `HNS_RELAY_CACHE_MINUTES`. Rejections are not
+cached, so every rejected event costs one outbound request. Rejections carry
+the NIP-01 `restricted:` prefix.
 
-The claim in the event is worthless on its own, which is precisely why it is
-safe to read it from the event: the name's own zone is what decides. A registry
-index that could answer for every name would be a registry that could mint any
-identity it liked, so the lookup deliberately goes to the name, not to us.
+To admit the holders of your own TLD, set `HNS_RELAY_SUFFIX` to it and serve
+`/.well-known/nostr.json` from each name.
 
-Affirmative answers are cached for `HNS_RELAY_CACHE_MINUTES`. Negative answers
-are **not** cached — somebody who claims a name should be able to post seconds
-later.
+## Test
 
-Rejections use the NIP-01 `restricted:` prefix, which clients render as "you
-are not allowed" rather than "your event was malformed".
+    go test ./...
 
-## Limits that apply either way
+## License
 
-Even fully open, the relay refuses events over `HNS_RELAY_MAX_CONTENT` and
-events dated more than 15 minutes in the future. The second one is not
-theoretical: a future-dated event sorts to the top of every client's feed and
-stays there.
-
-## Running one for your own TLD
-
-Nothing here is specific to `hns.one`. Set `HNS_RELAY_SUFFIX` to your TLD's
-suffix, serve `/.well-known/nostr.json` from your names, and the relay admits
-your holders. That is the whole integration.
+MIT. See [LICENSE](LICENSE).

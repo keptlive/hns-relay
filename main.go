@@ -1,19 +1,6 @@
-// hns-relay — a standards-compliant Nostr relay that knows about Handshake.
-//
-// TWO THINGS THIS IS, IN ORDER OF IMPORTANCE:
-//
-//  1. An ordinary Nostr relay. It speaks NIP-01 and nothing exotic. Any
-//     client can read from and write to it, and the events it stores are
-//     plain events that work everywhere else. If this stopped being true the
-//     project would have built an island, which is the opposite of the point.
-//
-//  2. Handshake-aware. It can restrict writes to people who control a
-//     Handshake name, verified by NIP-05 against that name's OWN zone. That
-//     is switched OFF by default and stays off until there is adoption worth
-//     protecting: a relay nobody can post to is a relay nobody joins.
-//
-// Anyone can run this for their own TLD — set HNS_RELAY_SUFFIX and turn
-// HNS_RELAY_REQUIRE_NAME on, and the relay admits that TLD's holders.
+// hns-relay is a Nostr relay (NIP-01, NIP-11) that can limit writes to
+// holders of names under a domain suffix, checked with NIP-05 against each
+// name's own host. The check is off by default; see admission.go.
 package main
 
 import (
@@ -107,7 +94,7 @@ func main() {
 			})
 		log.Printf("admission: Handshake names only (suffix %q)", suffix)
 	} else {
-		log.Printf("admission: OPEN — anyone may publish")
+		log.Printf("admission: open to anyone")
 	}
 
 	addr := env("HNS_RELAY_ADDR", "127.0.0.1:7447")
